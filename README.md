@@ -181,3 +181,33 @@ Community-ноды выполняют сторонний код на вашем 
 | Забыт пароль владельца | `docker compose exec n8n n8n user-management:reset` — вернёт мастер первичной настройки, данные сохранятся |
 | Вебхуки не срабатывают извне | `WEBHOOK_URL` в `.env` должен совпадать с реальным внешним адресом |
 | Нода не может писать в `/files` | На сервере: `chown -R 1000:1000 local-files` |
+
+## 12. Свои TLS-сертификаты (вместо Let's Encrypt)
+
+По умолчанию при указанном домене Caddy получает сертификат Let's Encrypt
+автоматически — ничего делать не нужно. Если есть собственные сертификаты,
+всё подключается одной командой на сервере:
+
+```bash
+bash setup.sh certs n8n.example.com /путь/к/fullchain.pem /путь/к/privkey.pem
+```
+
+Скрипт скопирует файлы в `certs/`, проверит их (PEM-формат, соответствие
+ключа сертификату, домен, срок действия, наличие цепочки CA), включит `tls`
+в `Caddyfile` и монтирование папки в `docker-compose.yml`, переключит `.env`
+на HTTPS-режим и перезапустит Caddy.
+
+- Если файлы уже лежат в `certs/` под именами `fullchain.pem` и `privkey.pem`,
+  пути в команде можно не указывать.
+- При полной установке (`sudo bash setup.sh домен`) скрипт сам найдёт файлы
+  в `certs/` и включит их вместо Let's Encrypt.
+- Продление — та же команда с новыми файлами.
+
+Форматы: `fullchain.pem` — сертификат домена + промежуточная цепочка CA.
+Если выданы отдельные `domain.crt` и `ca-bundle.crt`, склейте:
+`cat domain.crt ca-bundle.crt > fullchain.pem`. Если выдан PFX:
+`openssl pkcs12 -in cert.pfx -clcerts -nokeys -out fullchain.pem` и
+`openssl pkcs12 -in cert.pfx -nocerts -nodes -out privkey.pem`.
+
+Самоподписанные сертификаты для Telegram-триггера не подойдут — Telegram
+требует доверенный публичный CA.

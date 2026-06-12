@@ -7,6 +7,8 @@
 #   sudo bash setup.sh                  # полная установка (спросит домен/IP)
 #   sudo bash setup.sh n8n.example.com  # то же, но домен передан аргументом
 #   bash setup.sh nodes                 # только (до)установить ноды из списка
+#   bash setup.sh certs <домен> [/путь/fullchain.pem /путь/privkey.pem]
+#                                       # подключить/обновить СВОИ сертификаты
 #
 # Скрипт идемпотентен: повторный запуск ничего не ломает (существующий .env
 # не перезаписывается, установка нод просто обновляет список).
@@ -74,9 +76,84 @@ install_nodes() {
     "cd /home/node/.n8n/nodes && npm ls --depth=0" || true
 }
 
+set_env() { # set_env KEY VALUE — обновить или добавить строку в .env
+  local key=$1 val=$2
+  if grep -q "^${key}=" .env 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" .env
+  else
+    echo "${key}=${val}" >> .env
+  fi
+}
+
+enable_own_certs() { # включить tls в Caddyfile и монтирование certs/ в compose
+  sed -i 's|^# tls /certs/fullchain.pem /certs/privkey.pem|tls /certs/fullchain.pem /certs/privkey.pem|' Caddyfile
+  sed -i 's|^      # - ./certs:/certs:ro|      - ./certs:/certs:ro|' docker-compose.yml
+}
+
+check_certs() { # check_certs <домен> — проверка файлов сертификата
+  command -v openssl >/dev/null 2>&1 \
+    || { warn "openssl не найден — пропускаю проверку сертификата"; return 0; }
+  openssl x509 -in certs/fullchain.pem -noout >/dev/null 2>&1 \
+    || die "certs/fullchain.pem не похож на PEM-сертификат"
+  openssl x509 -in certs/fullchain.pem -noout -checkend 0 >/dev/null \
+    || die "сертификат уже истёк"
+  openssl x509 -in certs/fullchain.pem -noout -checkend 1209600 >/dev/null \
+    || warn "сертификат истекает менее чем через 14 дней"
+  local cert_pub key_pub
+  cert_pub=$(openssl x509 -in certs/fullchain.pem -noout -pubkey 2>/dev/null)
+  key_pub=$(openssl pkey -in certs/privkey.pem -pubout 2>/dev/null) \
+    || die "certs/privkey.pem не похож на приватный ключ"
+  [ "$cert_pub" = "$key_pub" ] || die "приватный ключ не соответствует сертификату"
+  if ! openssl x509 -in certs/fullchain.pem -noout -checkhost "$1" 2>/dev/null | grep -q "does match"; then
+    warn "не удалось подтвердить, что сертификат выписан на $1 — проверьте сами"
+  fi
+  [ "$(grep -c 'BEGIN CERTIFICATE' certs/fullchain.pem)" -ge 2 ] \
+    || warn "в fullchain.pem только один сертификат — без цепочки CA Telegram-вебхуки не заработают"
+}
+
 # ============================ режим "только ноды" ============================
 if [ "${1:-}" = "nodes" ]; then
   install_nodes
+  exit 0
+fi
+
+# ========================= режим "свои сертификаты" ==========================
+if [ "${1:-}" = "certs" ]; then
+  DOMAIN=${2:-}
+  [ -n "$DOMAIN" ] || die "использование: bash setup.sh certs <домен> [fullchain.pem privkey.pem]"
+  [ -f .env ] || die "сначала выполните полную установку: sudo bash setup.sh $DOMAIN"
+
+  mkdir -p certs
+  if [ -n "${3:-}" ]; then
+    [ -f "$3" ] || die "нет файла: $3"
+    [ -f "${4:-}" ] || die "укажите оба файла: bash setup.sh certs $DOMAIN fullchain.pem privkey.pem"
+    [ "$(readlink -f "$3")" = "$(readlink -f certs/fullchain.pem 2>/dev/null || true)" ] || cp -f "$3" certs/fullchain.pem
+    [ "$(readlink -f "$4")" = "$(readlink -f certs/privkey.pem 2>/dev/null || true)" ] || cp -f "$4" certs/privkey.pem
+  fi
+  [ -f certs/fullchain.pem ] && [ -f certs/privkey.pem ] \
+    || die "положите файлы certs/fullchain.pem и certs/privkey.pem (или передайте пути аргументами)"
+  chmod 600 certs/privkey.pem 2>/dev/null || true
+
+  check_certs "$DOMAIN"
+  enable_own_certs
+
+  set_env N8N_SITE_ADDRESS "$DOMAIN"
+  set_env N8N_HOST "$DOMAIN"
+  set_env N8N_PROTOCOL "https"
+  set_env WEBHOOK_URL "https://$DOMAIN/"
+  set_env N8N_SECURE_COOKIE "true"
+
+  log "Применяю конфигурацию..."
+  docker compose up -d
+  docker compose restart caddy >/dev/null
+
+  if command -v curl >/dev/null 2>&1 \
+     && curl -sSI --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/healthz" >/dev/null 2>&1; then
+    log "HTTPS работает: https://$DOMAIN"
+  else
+    warn "не удалось подтвердить HTTPS локально (не всегда ошибка) — проверьте в браузере: https://$DOMAIN и логи: docker compose logs caddy"
+  fi
+  echo "Продление: положите новые файлы и снова выполните  bash setup.sh certs $DOMAIN"
   exit 0
 fi
 
@@ -127,7 +204,13 @@ else
   if [ -n "$DOMAIN" ]; then
     SITE=$DOMAIN; HOST=$DOMAIN; PROTO=https
     URL="https://$DOMAIN/"; SECURE=true
-    log "Режим HTTPS: убедитесь, что A-запись $DOMAIN указывает на этот сервер"
+    if [ -f certs/fullchain.pem ] && [ -f certs/privkey.pem ]; then
+      log "Найдены свои сертификаты в certs/ — Let's Encrypt не понадобится"
+      check_certs "$DOMAIN"
+      enable_own_certs
+    else
+      log "Режим HTTPS: убедитесь, что A-запись $DOMAIN указывает на этот сервер"
+    fi
   else
     IP_GUESS=$(curl -fsS4 --max-time 10 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
     IP=$IP_GUESS
@@ -161,6 +244,11 @@ GENERIC_TIMEZONE=Asia/Tashkent
 EOF
   chmod 600 .env
   warn "Секреты сгенерированы и записаны в .env — сохраните копию N8N_ENCRYPTION_KEY!"
+fi
+
+# Если свои сертификаты уже лежат в certs/, а .env настроен на https — включаем их
+if [ -f certs/fullchain.pem ] && [ -f certs/privkey.pem ] && grep -q '^N8N_PROTOCOL=https$' .env 2>/dev/null; then
+  enable_own_certs
 fi
 
 # ------------------------- 3. Папка обмена файлами ---------------------------

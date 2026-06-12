@@ -85,6 +85,8 @@ services:
       N8N_SITE_ADDRESS: ${N8N_SITE_ADDRESS}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Раскомментируйте для своих сертификатов (см. Caddyfile, блок tls)
+      # - ./certs:/certs:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
